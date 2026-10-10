@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lingualoom-epub"
+version = "1.0.0"
+description = "Create bilingual, side-by-side EPUBs using a local Ollama Qwen model."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Bruno F Blini" }]
+license = { text = "MIT" }
+dependencies = [
+  "EbookLib>=0.18",
+  "beautifulsoup4>=4.12",
+  "requests>=2.31",
+]
+
+[project.scripts]
+lingualoom = "lingualoom.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lingualoom*"]
