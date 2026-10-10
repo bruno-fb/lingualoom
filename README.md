@@ -13,6 +13,8 @@
 - Defaults to English as the target language.
 - Writes a new file named `originalname_translated.epub`; the source file is not overwritten.
 - Caches repeated text blocks during a run to avoid translating identical passages twice.
+- Counts paragraphs/text blocks before translating and shows a live progress bar plus the current chapter.
+- Keeps the model loaded between requests and bounds generation length to reduce avoidable delays.
 
 ## Requirements
 

@@ -8,6 +8,8 @@ from pathlib import Path
 import requests
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString, Tag
+from copy import copy
+from tqdm import tqdm
 
 AUTHOR = "Bruno F Blini"
 OLLAMA_URL = "http://localhost:11434"
@@ -48,7 +50,7 @@ def ollama_tags() -> list[str]:
 def ollama_generate(model: str, prompt: str, timeout: int = 180) -> str:
     response = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.1}},
+        json={"model": model, "prompt": prompt, "stream": False, "keep_alive": "10m", "think": False, "options": {"temperature": 0.1, "num_predict": 512}},
         timeout=timeout,
     )
     response.raise_for_status()
@@ -116,54 +118,56 @@ def safe_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "language"
 
 
-def build_bilingual_html(
-    item: epub.EpubHtml,
-    model: str,
-    source_language: str,
-    target_language: str,
-    cache: dict[str, str],
-) -> bytes:
+def collect_translatable_tags(body: Tag) -> list[Tag]:
+    """Return translatable blocks, excluding blocks nested inside another block."""
+    tags = list(body.find_all(is_translatable_text))
+    ids = {id(tag) for tag in tags}
+    result = []
+    for tag in tags:
+        if any(isinstance(parent, Tag) and parent is not body and id(parent) in ids for parent in tag.parents):
+            continue
+        if tag.get_text(" ", strip=True):
+            result.append(tag)
+    return result
+
+
+def count_translatable_blocks(book: epub.EpubBook) -> int:
+    total = 0
+    for item in book.get_items():
+        if item.get_type() != 9:
+            continue
+        soup = BeautifulSoup(item.get_content(), "html.parser")
+        if soup.body:
+            total += len(collect_translatable_tags(soup.body))
+    return total
+
+
+def build_bilingual_html(item, model, source_language, target_language, cache, progress) -> bytes:
     soup = BeautifulSoup(item.get_content(), "html.parser")
     body = soup.body
     if body is None:
         return item.get_content()
 
-    # Add styles locally to each XHTML document so readers do not need external assets.
     style = soup.new_tag("style", type="text/css")
     style.string = """
-    .ll-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-              gap: 1.1em; align-items: start; margin: 0 0 1em; }
+    .ll-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.1em; align-items: start; margin: 0 0 1em; }
     .ll-original, .ll-translation { min-width: 0; overflow-wrap: anywhere; }
     .ll-translation { border-left: 1px solid #aaa; padding-left: 1em; }
-    .ll-label { font-size: .75em; font-weight: bold; text-transform: uppercase;
-                letter-spacing: .04em; color: #666; margin-bottom: .35em; }
+    .ll-label { font-size: .75em; font-weight: bold; text-transform: uppercase; letter-spacing: .04em; color: #666; margin-bottom: .35em; }
     .ll-content { margin: 0; }
-    @media (max-width: 560px) {
-      .ll-row { grid-template-columns: 1fr; gap: .35em; }
-      .ll-translation { border-left: 0; border-top: 1px solid #aaa; padding: .5em 0 0; }
-    }
+    @media (max-width: 560px) { .ll-row { grid-template-columns: 1fr; gap: .35em; } .ll-translation { border-left: 0; border-top: 1px solid #aaa; padding: .5em 0 0; } }
     """
     head = soup.head
-    if head is None:
+    if head is None and soup.find("html"):
         head = soup.new_tag("head")
-        html_tag = soup.find("html")
-        if html_tag:
-            html_tag.insert(0, head)
+        soup.find("html").insert(0, head)
     if head is not None:
         head.append(style)
 
-    # Replace text-bearing blocks with a two-column row, keeping their inner markup.
-    candidates = list(body.find_all(is_translatable_text))
-    for tag in candidates:
-        if tag.find_parent(class_="ll-row") is not None:
-            continue
+    for tag in collect_translatable_tags(body):
         source_text = tag.get_text(" ", strip=True)
-        if not source_text:
-            continue
-        # Avoid translating nested blocks twice (e.g. paragraphs inside blockquotes).
-        if any(parent in candidates for parent in tag.parents if isinstance(parent, Tag) and parent is not body):
-            continue
         if source_text not in cache:
+            progress.set_postfix_str(f"Translating: {source_text[:35]}...")
             cache[source_text] = translate_paragraph(model, source_language, target_language, source_text)
         translated = cache[source_text]
 
@@ -173,9 +177,8 @@ def build_bilingual_html(
         left_label.string = source_language
         left.append(left_label)
         original_clone = soup.new_tag(tag.name, attrs={"class": "ll-content"})
-        # Keep the source content's markup, not just its flattened text.
-        for child in list(tag.contents):
-            original_clone.append(child.extract() if isinstance(child, NavigableString) else child.extract())
+        for child in tag.contents:
+            original_clone.append(copy(child))
         left.append(original_clone)
 
         right = soup.new_tag("div", attrs={"class": "ll-translation"})
@@ -188,6 +191,7 @@ def build_bilingual_html(
         row.append(left)
         row.append(right)
         tag.replace_with(row)
+        progress.update(1)
 
     return str(soup).encode("utf-8")
 
@@ -206,18 +210,24 @@ def create_translated_epub(
     if not docs:
         raise RuntimeError("No readable XHTML/HTML content was found in this EPUB.")
 
-    total = 0
-    for item in docs:
-        print(f"Processing chapter: {item.get_name()}")
-        item.set_content(build_bilingual_html(item, model, source_language, target_language, cache))
-        total += 1
+    total_blocks = count_translatable_blocks(book)
+    if total_blocks == 0:
+        raise RuntimeError("No readable paragraphs or text blocks were found in this EPUB.")
+    print(f"Found {total_blocks:,} paragraphs/text blocks across {len(docs):,} chapter files.", flush=True)
+    cache = {}
+    with tqdm(total=total_blocks, unit="paragraph", desc="Translating", dynamic_ncols=True) as progress:
+        for index, item in enumerate(docs, start=1):
+            print(f"\nChapter {index}/{len(docs)}: {item.get_name()}", flush=True)
+            item.set_content(build_bilingual_html(item, model, source_language, target_language, cache, progress))
 
-    book.set_identifier(f"{book.get_metadata('DC', 'identifier')[0][0] if book.get_metadata('DC', 'identifier') else source_path.stem}-lingualoom")
+    identifiers = book.get_metadata("DC", "identifier")
+    original_identifier = identifiers[0][0] if identifiers else source_path.stem
+    book.set_identifier(f"{original_identifier}-lingualoom")
     book.add_metadata("DC", "creator", AUTHOR)
     book.add_metadata("DC", "description", f"Bilingual edition: {source_language} / {target_language}. Created with LinguaLoom.")
     book.add_metadata("DC", "language", safe_slug(source_language))
     epub.write_epub(str(output), book)
-    print(f"Processed {total} content documents; translated {len(cache)} unique text blocks.")
+    print(f"Processed {len(docs)} content files; translated {len(cache)} unique text blocks.")
     return output
 
 
