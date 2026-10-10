@@ -71,7 +71,7 @@ python -m lingualoom
 
 The program will ask you to:
 
-1. Choose the original `.epub` file by entering its path.
+1. Choose the original `.epub` file with a file picker (`BROWSE` by default), or enter a filename, relative path, or absolute path.
 2. Enter the original language (for example, `Portuguese`).
 3. Choose the target language (defaults to `English`).
 4. Choose an installed Qwen model.
@@ -89,7 +89,7 @@ The Little Prince_translated.epub
 
 LinguaLoom instructs Qwen to preserve meaning, sentence order, and source structure, favouring transparent, close translations over elegant rewrites. It does not ask for grammar explanations or translator notes.
 
-Translations are generated block by block. A block may be a paragraph, heading, list item, caption, or definition-list item. EPUBs vary widely, so complex layouts, footnotes, tables, poetry, and unusual markup may not be represented perfectly. Always proofread the output before relying on it for study.
+Translations are generated in small batches of up to five paragraphs per model request to reduce overhead. If Qwen returns malformed or incomplete batch output, LinguaLoom retries that batch paragraph by paragraph. Translation results are cached individually, so a failed run can reuse successful translations. Translations are rendered block by block. A block may be a paragraph, heading, list item, caption, or definition-list item. EPUBs vary widely, so complex layouts, footnotes, tables, poetry, and unusual markup may not be represented perfectly. Always proofread the output before relying on it for study.
 
 ## Privacy
 

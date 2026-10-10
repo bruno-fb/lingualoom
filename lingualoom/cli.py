@@ -6,6 +6,7 @@ import sys
 import sqlite3
 import hashlib
 import os
+import json
 from pathlib import Path
 
 import requests
@@ -26,11 +27,51 @@ def ask(prompt: str, default: str | None = None) -> str:
 
 
 def choose_epub() -> Path:
+    """Choose an EPUB with a file picker or relative/absolute path input."""
+    print(f"Current working directory: {Path.cwd()}")
+    print("Enter a filename (book.epub), relative path (books/book.epub), absolute path, or BROWSE.")
     while True:
-        raw = ask("Path to the original EPUB file")
-        path = Path(raw.strip('"').strip("'")).expanduser()
+        raw = ask("Original EPUB path", "BROWSE").strip()
+        if raw.upper() == "BROWSE":
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                selected = filedialog.askopenfilename(
+                    title="Choose original EPUB",
+                    filetypes=[("EPUB books", "*.epub"), ("All files", "*.*")],
+                )
+                root.destroy()
+                if selected:
+                    return Path(selected).expanduser().resolve()
+                print("No file selected. Enter a path or choose BROWSE again.")
+                continue
+            except Exception:
+                print("File picker unavailable; enter a path manually.")
+                continue
+        raw = raw.strip('"').strip("'")
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
         if not path.exists():
-            print("That path does not exist. Try again.")
+            try:
+                matches = sorted(Path.cwd().glob(raw))
+            except (ValueError, OSError):
+                matches = []
+            if matches:
+                print("Matching paths:")
+                for candidate in matches[:15]:
+                    print(f"  {candidate}")
+            else:
+                epubs = sorted(Path.cwd().glob("*.epub"))
+                if epubs:
+                    print("EPUB files in the current directory:")
+                    for candidate in epubs[:20]:
+                        print(f"  {candidate.name}")
+                else:
+                    print("Path not found. Relative paths are resolved from the current working directory.")
             continue
         if not path.is_file() or path.suffix.lower() != ".epub":
             print("Please choose an .epub file.")
@@ -53,7 +94,7 @@ def ollama_tags() -> list[str]:
 def ollama_generate(model: str, prompt: str, timeout: int = 180) -> str:
     response = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False, "keep_alive": "10m", "think": False, "options": {"temperature": 0.1, "num_predict": 512}},
+        json={"model": model, "prompt": prompt, "stream": False, "keep_alive": "10m", "think": False, "options": {"temperature": 0.1, "num_predict": 2048}},
         timeout=timeout,
     )
     response.raise_for_status()
@@ -96,6 +137,36 @@ PASSAGE:
 """
     result = ollama_generate(model, prompt)
     return result or "[Translation unavailable]"
+
+
+def translate_batch(model: str, source_language: str, target_language: str, paragraphs: list[str]) -> list[str]:
+    """Translate several paragraphs in one call while preserving paragraph boundaries."""
+    payload = [{"id": i, "text": value} for i, value in enumerate(paragraphs, start=1)]
+    prompt = f"""Translate each item from {source_language} into {target_language} for language learners.
+Return ONLY a valid JSON array of objects with exactly these keys: id, translation.
+Include one object for every input id, in the same order. Do not merge, omit, explain, or add notes.
+Keep each translation close to the original wording and sentence structure.
+
+INPUT JSON:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    raw = ollama_generate(model, prompt, timeout=300)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
+    try:
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict):
+            decoded = decoded.get("translations", decoded.get("items"))
+        if not isinstance(decoded, list):
+            raise ValueError("Batch response was not a JSON list")
+        found = {}
+        for item in decoded:
+            if isinstance(item, dict) and "id" in item and "translation" in item:
+                found[int(item["id"])] = str(item["translation"]).strip()
+        if len(found) != len(paragraphs) or any(not found.get(i) for i in range(1, len(paragraphs) + 1)):
+            raise ValueError("Batch response omitted one or more translations")
+        return [found[i] for i in range(1, len(paragraphs) + 1)]
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Qwen returned an incomplete batch; retrying paragraphs individually") from exc
 
 
 class TranslationCache:
@@ -189,7 +260,8 @@ def count_translatable_blocks(book: epub.EpubBook) -> int:
     return total
 
 
-def build_bilingual_html(item, model, source_language, target_language, cache, progress) -> bytes:
+def build_bilingual_html(item, model, source_language, target_language, cache, progress,
+                        batch_size: int = 5, max_batch_chars: int = 4500) -> bytes:
     soup = BeautifulSoup(item.get_content(), "html.parser")
     body = soup.body
     if body is None:
@@ -211,13 +283,46 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
     if head is not None:
         head.append(style)
 
-    for tag in collect_translatable_tags(body):
-        source_text = tag.get_text(" ", strip=True)
+    tags = collect_translatable_tags(body)
+    texts = [tag.get_text(" ", strip=True) for tag in tags]
+    missing_indices = [i for i, value in enumerate(texts) if value and cache.get(value) is None]
+    cached_count = sum(1 for value in texts if value and cache.get(value) is not None)
+    progress.update(cached_count)
+
+    batches, current, current_chars = [], [], 0
+    for idx in missing_indices:
+        size = len(texts[idx])
+        if current and (len(current) >= batch_size or current_chars + size > max_batch_chars):
+            batches.append(current)
+            current, current_chars = [], 0
+        current.append(idx)
+        current_chars += size
+    if current:
+        batches.append(current)
+
+    for batch in batches:
+        progress.set_postfix_str(f"Translating batch ({len(batch)} paragraphs)")
+        batch_texts = [texts[i] for i in batch]
+        try:
+            translations = translate_batch(model, source_language, target_language, batch_texts)
+        except (ValueError, requests.RequestException, RuntimeError) as exc:
+            print(f"\nBatch fallback to individual paragraphs: {exc}", flush=True)
+            translations = [translate_paragraph(model, source_language, target_language, source)
+                            for source in batch_texts]
+        for idx, translated in zip(batch, translations):
+            cache.put(texts[idx], translated)
+            progress.update(1)
+
+    for tag, source_text in zip(tags, texts):
+        if not source_text:
+            continue
         translated = cache.get(source_text)
         if translated is None:
-            progress.set_postfix_str(f"Translating: {source_text[:35]}...")
+            # Defensive fallback; persist immediately to support resume after failure.
+            progress.set_postfix_str("Translating one paragraph")
             translated = translate_paragraph(model, source_language, target_language, source_text)
             cache.put(source_text, translated)
+            progress.update(1)
 
         row = soup.new_tag("div", attrs={"class": "ll-row"})
         left = soup.new_tag("div", attrs={"class": "ll-original"})
@@ -239,7 +344,6 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
         row.append(left)
         row.append(right)
         tag.replace_with(row)
-        progress.update(1)
 
     return str(soup).encode("utf-8")
 
