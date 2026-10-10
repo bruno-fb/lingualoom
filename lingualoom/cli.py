@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 import sys
+import sqlite3
+import hashlib
+import os
 from pathlib import Path
 
 import requests
@@ -95,6 +98,50 @@ PASSAGE:
     return result or "[Translation unavailable]"
 
 
+class TranslationCache:
+    """Persistent SQLite cache; successful paragraph translations survive crashes."""
+    def __init__(self, path: Path, model: str, source_language: str, target_language: str):
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS translations (
+            cache_key TEXT PRIMARY KEY,
+            translation TEXT NOT NULL,
+            model TEXT NOT NULL,
+            source_language TEXT NOT NULL,
+            target_language TEXT NOT NULL,
+            source_text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        self.connection.commit()
+        self.model = model
+        self.source_language = source_language
+        self.target_language = target_language
+
+    def _key(self, text: str) -> str:
+        raw = "\0".join((self.model, self.source_language.casefold(), self.target_language.casefold(), text))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get(self, text: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT translation FROM translations WHERE cache_key = ?", (self._key(text),)
+        ).fetchone()
+        return row[0] if row else None
+
+    def put(self, text: str, translation: str) -> None:
+        self.connection.execute(
+            """INSERT OR REPLACE INTO translations
+            (cache_key, translation, model, source_language, target_language, source_text, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (self._key(text), translation, self.model, self.source_language,
+             self.target_language, text),
+        )
+        # Commit every completed paragraph so a crash loses at most the current request.
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
 def is_translatable_text(tag: Tag) -> bool:
     return tag.name in {"p", "blockquote", "li", "h1", "h2", "h3", "h4", "h5", "h6", "figcaption", "dt", "dd"}
 
@@ -166,10 +213,11 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
 
     for tag in collect_translatable_tags(body):
         source_text = tag.get_text(" ", strip=True)
-        if source_text not in cache:
+        translated = cache.get(source_text)
+        if translated is None:
             progress.set_postfix_str(f"Translating: {source_text[:35]}...")
-            cache[source_text] = translate_paragraph(model, source_language, target_language, source_text)
-        translated = cache[source_text]
+            translated = translate_paragraph(model, source_language, target_language, source_text)
+            cache.put(source_text, translated)
 
         row = soup.new_tag("div", attrs={"class": "ll-row"})
         left = soup.new_tag("div", attrs={"class": "ll-original"})
@@ -203,31 +251,47 @@ def create_translated_epub(
     model: str,
 ) -> Path:
     book = epub.read_epub(str(source_path))
-    cache: dict[str, str] = {}
     output = source_path.with_name(f"{source_path.stem}_translated.epub")
+    checkpoint = output.with_suffix(".partial.epub")
+    cache_path = source_path.with_name(f"{source_path.stem}_lingualoom_cache.sqlite3")
 
     docs = [item for item in book.get_items() if item.get_type() == 9]
     if not docs:
         raise RuntimeError("No readable XHTML/HTML content was found in this EPUB.")
-
     total_blocks = count_translatable_blocks(book)
     if total_blocks == 0:
         raise RuntimeError("No readable paragraphs or text blocks were found in this EPUB.")
-    print(f"Found {total_blocks:,} paragraphs/text blocks across {len(docs):,} chapter files.", flush=True)
-    cache = {}
-    with tqdm(total=total_blocks, unit="paragraph", desc="Translating", dynamic_ncols=True) as progress:
-        for index, item in enumerate(docs, start=1):
-            print(f"\nChapter {index}/{len(docs)}: {item.get_name()}", flush=True)
-            item.set_content(build_bilingual_html(item, model, source_language, target_language, cache, progress))
 
-    identifiers = book.get_metadata("DC", "identifier")
-    original_identifier = identifiers[0][0] if identifiers else source_path.stem
-    book.set_identifier(f"{original_identifier}-lingualoom")
-    book.add_metadata("DC", "creator", AUTHOR)
-    book.add_metadata("DC", "description", f"Bilingual edition: {source_language} / {target_language}. Created with LinguaLoom.")
-    book.add_metadata("DC", "language", safe_slug(source_language))
-    epub.write_epub(str(output), book)
-    print(f"Processed {len(docs)} content files; translated {len(cache)} unique text blocks.")
+    print(f"Found {total_blocks:,} text blocks across {len(docs):,} chapter/content files.", flush=True)
+    print(f"Persistent translation cache: {cache_path}", flush=True)
+    print("Each chapter is processed and checkpointed before moving to the next.", flush=True)
+    cache = TranslationCache(cache_path, model, source_language, target_language)
+    try:
+        with tqdm(total=total_blocks, unit="paragraph", desc="Translating", dynamic_ncols=True) as progress:
+            for index, item in enumerate(docs, start=1):
+                print(f"\nChapter {index}/{len(docs)}: {item.get_name()}", flush=True)
+                # Build exactly one chapter at a time. The SQLite cache is committed
+                # after each successful translation, then the partially completed EPUB
+                # is atomically replaced with a fresh checkpoint after this chapter.
+                item.set_content(build_bilingual_html(
+                    item, model, source_language, target_language, cache, progress
+                ))
+                identifiers = book.get_metadata("DC", "identifier")
+                original_identifier = identifiers[0][0] if identifiers else source_path.stem
+                book.set_identifier(f"{original_identifier}-lingualoom")
+                book.add_metadata("DC", "creator", AUTHOR)
+                book.add_metadata("DC", "description", f"Bilingual edition: {source_language} / {target_language}. Created with LinguaLoom.")
+                book.add_metadata("DC", "language", safe_slug(source_language))
+                epub.write_epub(str(checkpoint), book)
+                os.replace(checkpoint, output)
+                print(f"Checkpoint saved after chapter {index}/{len(docs)}.", flush=True)
+    finally:
+        cache.close()
+        if checkpoint.exists():
+            checkpoint.unlink()
+
+    print(f"Processed {len(docs)} content files. Translation cache saved at: {cache_path}")
+    print("You can keep the cache file for future retries; it avoids repeating completed translations.")
     return output
 
 
