@@ -7,7 +7,8 @@
 ## Features
 
 - Keeps the original EPUB's chapter structure and most of its source formatting.
-- Places each supported text block beside its translation in a two-column layout.
+- Places original and translated text in **equal-width 50/50 columns**, like two books open side by side.
+- Duplicates original EPUB images in the corresponding right-hand column, including standalone illustrations.
 - Prompts Qwen for a close, structure-conscious translation instead of polished literary prose.
 - Checks whether the source text matches the language you entered before translating.
 - Defaults to English as the target language.
@@ -33,7 +34,7 @@ ollama pull qwen2.5:7b
 
 Make sure the local Ollama service is running. The default API endpoint is `http://localhost:11434`.
 
-You can use another installed Qwen model, including a larger one if your machine has enough memory. LinguaLoom lists installed Qwen models when it starts.
+LinguaLoom automatically selects the newest Qwen generation installed locally; it does not ask you to choose a model. To use a newer generation, pull it with Ollama before running LinguaLoom.
 
 ## 2. Set up LinguaLoom
 
@@ -106,7 +107,7 @@ The model inference requests go to your local Ollama server at `localhost`. Ling
 - Run `ollama pull qwen2.5:7b`, then restart LinguaLoom.
 
 **Slow translation**
-- Smaller models generally run faster; larger models may produce better translations but need more RAM/VRAM.
+- LinguaLoom automatically uses the newest Qwen generation already installed. Smaller model variants generally run faster; larger variants may produce better translations but need more RAM/VRAM. Pull a preferred newer Qwen generation with Ollama if it is not installed yet.
 - The first run can be slower while Ollama loads the model.
 
 **Language check fails**

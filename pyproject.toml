@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingualoom-epub"
-version = "1.0.0"
+version = "1.1.0"
 description = "Create bilingual, side-by-side EPUBs using a local Ollama Qwen model."
 readme = "README.md"
 requires-python = ">=3.10"

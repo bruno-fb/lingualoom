@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import os
 import json
+import time
 from pathlib import Path
 
 import requests
@@ -29,7 +30,7 @@ def ask(prompt: str, default: str | None = None) -> str:
 def choose_epub() -> Path:
     """Choose an EPUB with a file picker or relative/absolute path input."""
     print(f"Current working directory: {Path.cwd()}")
-    print("Enter a filename (book.epub), relative path (books/book.epub), absolute path, or BROWSE.")
+    print("Enter a filename (the .epub extension is optional), relative/absolute path, or BROWSE.")
     while True:
         raw = ask("Original EPUB path", "BROWSE").strip()
         if raw.upper() == "BROWSE":
@@ -55,9 +56,15 @@ def choose_epub() -> Path:
         path = Path(raw).expanduser()
         if not path.is_absolute():
             path = Path.cwd() / path
+        # Convenience: accept "book" when the actual file is "book.epub".
+        candidates = [path]
+        if not path.suffix:
+            candidates.append(Path(f"{path}.epub"))
+        path = next((candidate for candidate in candidates if candidate.is_file()), path)
         if not path.exists():
             try:
-                matches = sorted(Path.cwd().glob(raw))
+                pattern = raw if Path(raw).suffix else f"{raw}.epub"
+                matches = sorted(Path.cwd().glob(pattern))
             except (ValueError, OSError):
                 matches = []
             if matches:
@@ -74,21 +81,57 @@ def choose_epub() -> Path:
                     print("Path not found. Relative paths are resolved from the current working directory.")
             continue
         if not path.is_file() or path.suffix.lower() != ".epub":
-            print("Please choose an .epub file.")
+            print("Please choose an .epub file (the extension may be omitted when entering its path).")
             continue
         return path.resolve()
 
 
-def ollama_tags() -> list[str]:
+def ollama_models() -> list[dict]:
+    """Return Ollama model metadata so we can automatically choose the newest Qwen family."""
     try:
         response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         response.raise_for_status()
-        return [item.get("name", "") for item in response.json().get("models", [])]
+        return response.json().get("models", [])
     except requests.RequestException as exc:
         raise RuntimeError(
             "Could not reach Ollama at http://localhost:11434. "
             "Make sure Ollama is installed and running."
         ) from exc
+
+
+def latest_qwen_model(models: list[dict]) -> str | None:
+    """Select the newest installed Qwen generation, breaking ties by latest pull time."""
+    candidates = []
+    for item in models:
+        name = item.get("name", "")
+        if "qwen" not in name.lower():
+            continue
+        match = re.search(r"qwen[-_ ]?(\d+(?:\.\d+)*)", name, re.IGNORECASE)
+        version = tuple(int(part) for part in match.group(1).split(".")) if match else (0,)
+        # Ollama reports RFC3339 timestamps in modified_at for locally available models.
+        modified = str(item.get("modified_at", ""))
+        candidates.append((version, modified, name))
+    if not candidates:
+        return None
+    return max(candidates)[2]
+
+
+def replace_checkpoint(checkpoint: Path, output: Path, attempts: int = 8) -> None:
+    """Replace the output atomically, retrying transient Windows file-lock errors."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            os.replace(checkpoint, output)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(0.25 * (attempt + 1), 1.5))
+    raise PermissionError(
+        f"Windows could not replace the output EPUB because a file is locked. "
+        f"Close the EPUB in any reader/preview pane and retry. The complete checkpoint "
+        f"has been preserved at: {checkpoint}"
+    ) from last_error
 
 
 def ollama_generate(model: str, prompt: str, timeout: int = 180) -> str:
@@ -269,12 +312,14 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
 
     style = soup.new_tag("style", type="text/css")
     style.string = """
-    .ll-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.1em; align-items: start; margin: 0 0 1em; }
-    .ll-original, .ll-translation { min-width: 0; overflow-wrap: anywhere; }
-    .ll-translation { border-left: 1px solid #aaa; padding-left: 1em; }
+    /* A fixed 50/50 table layout is more reliable in EPUB readers than CSS Grid. */
+    .ll-row { display: table; width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; margin: 0 0 1em; page-break-inside: avoid; break-inside: avoid; }
+    .ll-original, .ll-translation { display: table-cell; width: 50%; min-width: 0; vertical-align: top; box-sizing: border-box; overflow-wrap: anywhere; padding: 0 .75em 0 0; }
+    .ll-translation { border-left: 1px solid #aaa; padding: 0 0 0 .75em; }
     .ll-label { font-size: .75em; font-weight: bold; text-transform: uppercase; letter-spacing: .04em; color: #666; margin-bottom: .35em; }
-    .ll-content { margin: 0; }
-    @media (max-width: 560px) { .ll-row { grid-template-columns: 1fr; gap: .35em; } .ll-translation { border-left: 0; border-top: 1px solid #aaa; padding: .5em 0 0; } }
+    .ll-content { margin: 0; max-width: 100%; }
+    .ll-original img, .ll-translation img, .ll-media-row img { max-width: 100%; height: auto; }
+    .ll-media-row { page-break-inside: avoid; break-inside: avoid; }
     """
     head = soup.head
     if head is None and soup.find("html"):
@@ -313,6 +358,24 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
             cache.put(texts[idx], translated)
             progress.update(1)
 
+    # Images not contained in a translatable text block (e.g. standalone figures)
+    # get their own paired row so the illustration is visible in both book columns.
+    translatable_ids = {id(tag) for tag in tags}
+    standalone_images = []
+    for image_tag in list(body.find_all(["img"])):
+        if any(isinstance(parent, Tag) and id(parent) in translatable_ids for parent in image_tag.parents):
+            continue
+        standalone_images.append(image_tag)
+    for image_tag in standalone_images:
+        row = soup.new_tag("div", attrs={"class": "ll-row ll-media-row"})
+        left = soup.new_tag("div", attrs={"class": "ll-original"})
+        right = soup.new_tag("div", attrs={"class": "ll-translation"})
+        left.append(copy(image_tag))
+        right.append(copy(image_tag))
+        row.append(left)
+        row.append(right)
+        image_tag.replace_with(row)
+
     for tag, source_text in zip(tags, texts):
         if not source_text:
             continue
@@ -340,6 +403,10 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
         right.append(right_label)
         translation_tag = soup.new_tag("p", attrs={"class": "ll-content"})
         translation_tag.string = translated
+        # If the source paragraph contains inline illustrations, repeat them on the
+        # translation side as well as keeping them in the original-side clone.
+        for inline_image in original_clone.find_all(["img"]):
+            right.append(copy(inline_image))
         right.append(translation_tag)
         row.append(left)
         row.append(right)
@@ -356,7 +423,9 @@ def create_translated_epub(
 ) -> Path:
     book = epub.read_epub(str(source_path))
     output = source_path.with_name(f"{source_path.stem}_translated.epub")
-    checkpoint = output.with_suffix(".partial.epub")
+    # Unique same-directory temporary file: avoids stale checkpoint collisions and
+    # permits an atomic rename on Windows once EbookLib has closed the archive.
+    checkpoint = output.with_name(f".{output.stem}.{os.getpid()}.partial.epub")
     cache_path = source_path.with_name(f"{source_path.stem}_lingualoom_cache.sqlite3")
 
     docs = [item for item in book.get_items() if item.get_type() == 9]
@@ -387,12 +456,12 @@ def create_translated_epub(
                 book.add_metadata("DC", "description", f"Bilingual edition: {source_language} / {target_language}. Created with LinguaLoom.")
                 book.add_metadata("DC", "language", safe_slug(source_language))
                 epub.write_epub(str(checkpoint), book)
-                os.replace(checkpoint, output)
+                replace_checkpoint(checkpoint, output)
                 print(f"Checkpoint saved after chapter {index}/{len(docs)}.", flush=True)
     finally:
         cache.close()
-        if checkpoint.exists():
-            checkpoint.unlink()
+        # Do not delete a checkpoint after a failed Windows rename: it may be the
+        # only complete recovery copy of the translated chapters.
 
     print(f"Processed {len(docs)} content files. Translation cache saved at: {cache_path}")
     print("You can keep the cache file for future retries; it avoids repeating completed translations.")
@@ -403,24 +472,17 @@ def main() -> None:
     print("\nLinguaLoom — side-by-side language-learning EPUBs")
     print("Author: Bruno F Blini\n")
     try:
-        available = ollama_tags()
+        available_models = ollama_models()
     except RuntimeError as exc:
         print(f"\nError: {exc}")
         sys.exit(1)
 
-    qwen_models = [name for name in available if "qwen" in name.lower()]
-    if not qwen_models:
+    model = latest_qwen_model(available_models)
+    if not model:
         print("No Qwen model found in Ollama.")
-        print("Install one first, for example: ollama pull qwen2.5:7b")
+        print("Install one first, for example: ollama pull qwen3:8b")
         sys.exit(1)
-    default_model = next((name for name in qwen_models if name.startswith("qwen2.5:7b")), qwen_models[0])
-    print("Available Qwen models:")
-    for name in qwen_models:
-        print(f"  - {name}")
-    model = ask("Which Qwen model should LinguaLoom use", default_model)
-    if model not in available:
-        print(f"Model '{model}' is not installed in Ollama. Run: ollama pull {model}")
-        sys.exit(1)
+    print(f"Automatically selected latest installed Qwen model: {model}")
 
     source_path = choose_epub()
     source_language = ask("What is the original language (e.g. Portuguese, French, Japanese)")
