@@ -309,6 +309,33 @@ def count_translatable_blocks(book: epub.EpubBook) -> int:
     return total
 
 
+def sanitize_epub_items_for_write(book: epub.EpubBook) -> list[str]:
+    """Replace missing payloads on EPUB resources with empty bytes before serialization.
+
+    Some EPUBs contain manifest entries whose payload is missing. EbookLib can pass
+    those None values to its ZIP writer, which raises a low-level TypeError. Report
+    the affected item names so the source can be inspected if the book still fails.
+    """
+    repaired: list[str] = []
+    for item in book.get_items():
+        try:
+            payload = item.get_content()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read EPUB resource {item.get_name()!r} "
+                f"({type(item).__name__}): {exc}"
+            ) from exc
+        if payload is None:
+            setter = getattr(item, "set_content", None)
+            if not callable(setter):
+                raise RuntimeError(
+                    f"EPUB resource {item.get_name()!r} has no content and cannot be repaired."
+                )
+            setter(b"")
+            repaired.append(item.get_name())
+    return repaired
+
+
 def build_bilingual_html(item, model, source_language, target_language, cache, progress,
                         batch_size: int = 5, max_batch_chars: int = 4500) -> bytes:
     # EbookLib can expose empty/malformed document items with None content. Passing
@@ -481,7 +508,33 @@ def create_translated_epub(
                 book.add_metadata("DC", "creator", AUTHOR)
                 book.add_metadata("DC", "description", f"Bilingual edition: {source_language} / {target_language}. Created with LinguaLoom.")
                 book.add_metadata("DC", "language", safe_slug(source_language))
-                epub.write_epub(str(checkpoint), book)
+                repaired_items = sanitize_epub_items_for_write(book)
+                if repaired_items:
+                    print(
+                        "\nWarning: repaired missing payloads for EPUB resources: "
+                        + ", ".join(repaired_items),
+                        flush=True,
+                    )
+                try:
+                    epub.write_epub(str(checkpoint), book)
+                except Exception as exc:
+                    # Include resource diagnostics instead of only the generic
+                    # bytes/unicode/NoneType message from the ZIP/XML writer.
+                    none_items = []
+                    for resource in book.get_items():
+                        try:
+                            if resource.get_content() is None:
+                                none_items.append(resource.get_name())
+                        except Exception:
+                            none_items.append(resource.get_name() + " (content read failed)")
+                    detail = (
+                        f"; resources still reporting missing content: {', '.join(none_items)}"
+                        if none_items else "; no resources report missing content"
+                    )
+                    raise RuntimeError(
+                        f"EbookLib failed while writing the EPUB checkpoint{detail}. "
+                        f"Original error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 replace_checkpoint(checkpoint, output)
                 print(f"Checkpoint saved after chapter {index}/{len(docs)}.", flush=True)
     finally:

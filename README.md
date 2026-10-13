@@ -4,7 +4,7 @@
 
 **Author:** Bruno F Blini
 
-## Version 1.1.1
+## Version 1.1.2
 
 - Handles empty or malformed EPUB content items without passing `None` to EbookLib.
 - Uses a fixed-width, cleaner progress bar showing chapter, percentage, completed blocks, and ETA.
