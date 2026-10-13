@@ -265,7 +265,10 @@ def extract_sample(book: epub.EpubBook, limit: int = 12) -> str:
     for item in book.get_items():
         if item.get_type() != 9:  # ebooklib.ITEM_DOCUMENT
             continue
-        soup = BeautifulSoup(item.get_content(), "html.parser")
+        content = item.get_content()
+        if not content:
+            continue
+        soup = BeautifulSoup(content, "html.parser")
         for tag in soup.find_all(is_translatable_text):
             text = tag.get_text(" ", strip=True)
             if len(text) > 25:
@@ -297,7 +300,10 @@ def count_translatable_blocks(book: epub.EpubBook) -> int:
     for item in book.get_items():
         if item.get_type() != 9:
             continue
-        soup = BeautifulSoup(item.get_content(), "html.parser")
+        content = item.get_content()
+        if not content:
+            continue
+        soup = BeautifulSoup(content, "html.parser")
         if soup.body:
             total += len(collect_translatable_tags(soup.body))
     return total
@@ -305,10 +311,19 @@ def count_translatable_blocks(book: epub.EpubBook) -> int:
 
 def build_bilingual_html(item, model, source_language, target_language, cache, progress,
                         batch_size: int = 5, max_batch_chars: int = 4500) -> bytes:
-    soup = BeautifulSoup(item.get_content(), "html.parser")
+    # EbookLib can expose empty/malformed document items with None content. Passing
+    # that value back to set_content() raises: "Argument must be bytes or unicode,
+    # got 'NoneType'". Keep every returned document payload a real byte string.
+    content = item.get_content()
+    if content is None or content == b"" or content == "":
+        return b'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title></title></head><body></body></html>'
+    soup = BeautifulSoup(content, "html.parser")
     body = soup.body
     if body is None:
-        return item.get_content()
+        # Preserve documents without a <body> when possible, while normalizing
+        # their content to bytes for EbookLib's set_content().
+        serialized = str(soup).encode("utf-8")
+        return serialized or b'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head></head><body></body></html>'
 
     style = soup.new_tag("style", type="text/css")
     style.string = """
@@ -382,7 +397,6 @@ def build_bilingual_html(item, model, source_language, target_language, cache, p
         translated = cache.get(source_text)
         if translated is None:
             # Defensive fallback; persist immediately to support resume after failure.
-            progress.set_postfix_str("Translating one paragraph")
             translated = translate_paragraph(model, source_language, target_language, source_text)
             cache.put(source_text, translated)
             progress.update(1)
@@ -440,15 +454,27 @@ def create_translated_epub(
     print("Each chapter is processed and checkpointed before moving to the next.", flush=True)
     cache = TranslationCache(cache_path, model, source_language, target_language)
     try:
-        with tqdm(total=total_blocks, unit="paragraph", desc="Translating", dynamic_ncols=True) as progress:
+        with tqdm(
+            total=total_blocks,
+            desc="Translating",
+            unit="paragraphs",
+            ncols=100,
+            dynamic_ncols=False,
+            bar_format="{desc} |{bar:28}| {percentage:3.0f}% ({n_fmt}/{total_fmt} paragraphs) [{elapsed}<{remaining}]",
+        ) as progress:
             for index, item in enumerate(docs, start=1):
-                print(f"\nChapter {index}/{len(docs)}: {item.get_name()}", flush=True)
+                progress.set_description_str(f"Chapter {index}/{len(docs)}")
                 # Build exactly one chapter at a time. The SQLite cache is committed
                 # after each successful translation, then the partially completed EPUB
                 # is atomically replaced with a fresh checkpoint after this chapter.
-                item.set_content(build_bilingual_html(
+                translated_content = build_bilingual_html(
                     item, model, source_language, target_language, cache, progress
-                ))
+                )
+                if translated_content is None:
+                    raise RuntimeError(
+                        f"Internal error: content builder returned None for {item.get_name()}"
+                    )
+                item.set_content(translated_content)
                 identifiers = book.get_metadata("DC", "identifier")
                 original_identifier = identifiers[0][0] if identifiers else source_path.stem
                 book.set_identifier(f"{original_identifier}-lingualoom")
@@ -514,7 +540,8 @@ def main() -> None:
         print(f"\nOllama request failed: {exc}")
         sys.exit(1)
     except Exception as exc:
-        print(f"\nCould not create the translated EPUB: {exc}")
+        print(f"\nCould not create the translated EPUB ({type(exc).__name__}): {exc}")
+        print("If this happens again, please share the full error above and the chapter shown in the progress bar.")
         sys.exit(1)
 
 
