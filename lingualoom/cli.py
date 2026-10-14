@@ -8,6 +8,7 @@ import hashlib
 import os
 import json
 import time
+import traceback
 from pathlib import Path
 
 import requests
@@ -310,30 +311,141 @@ def count_translatable_blocks(book: epub.EpubBook) -> int:
 
 
 def sanitize_epub_items_for_write(book: epub.EpubBook) -> list[str]:
-    """Replace missing payloads on EPUB resources with empty bytes before serialization.
+    """Normalize raw and computed EPUB item payloads before EbookLib serializes them.
 
-    Some EPUBs contain manifest entries whose payload is missing. EbookLib can pass
-    those None values to its ZIP writer, which raises a low-level TypeError. Report
-    the affected item names so the source can be inspected if the book still fails.
+    EbookLib writers may read ``item.content`` directly, while some item classes
+    compute content in ``get_content()``. Checking only the getter can therefore
+    miss a raw ``None`` payload. Normalize both views and reject non-text/binary
+    payloads with a resource-specific error before entering the ZIP writer.
     """
     repaired: list[str] = []
-    for item in book.get_items():
+    for index, item in enumerate(book.get_items(), start=1):
+        name = getattr(item, "file_name", None) or getattr(item, "id", None) or f"<resource-{index}>"
+        raw_content = getattr(item, "content", None)
         try:
             payload = item.get_content()
         except Exception as exc:
             raise RuntimeError(
-                f"Could not read EPUB resource {item.get_name()!r} "
-                f"({type(item).__name__}): {exc}"
+                f"Could not read EPUB resource {name!r} "
+                f"({type(item).__name__}): {type(exc).__name__}: {exc}"
             ) from exc
+
+        # Prefer a usable getter result, but fall back to the raw payload if a
+        # custom item implementation returns None without exposing content.
         if payload is None:
-            setter = getattr(item, "set_content", None)
-            if not callable(setter):
+            payload = raw_content
+        if payload is None:
+            payload = b""
+            repaired.append(str(name))
+        elif not isinstance(payload, (bytes, str)):
+            raise RuntimeError(
+                f"EPUB resource {name!r} has unsupported content type "
+                f"{type(payload).__name__}; expected bytes, str, or None."
+            )
+
+        # Always set normalized content back on the item. This is intentionally
+        # done even when get_content() returned a valid value, because EbookLib's
+        # writer may use the underlying .content attribute directly.
+        setter = getattr(item, "set_content", None)
+        if callable(setter):
+            setter(payload)
+        else:
+            try:
+                item.content = payload
+            except Exception as exc:
                 raise RuntimeError(
-                    f"EPUB resource {item.get_name()!r} has no content and cannot be repaired."
-                )
-            setter(b"")
-            repaired.append(item.get_name())
+                    f"Could not normalize content for EPUB resource {name!r}: {exc}"
+                ) from exc
+
+        if getattr(item, "content", payload) is None:
+            raise RuntimeError(f"EPUB resource {name!r} still has None content after normalization.")
     return repaired
+
+
+def sanitize_toc_uids(book: epub.EpubBook) -> list[str]:
+    """Ensure every EPUB navigation node has a non-empty string UID.
+
+    Some otherwise readable EPUBs contain TOC links with ``uid=None``. EbookLib
+    uses each node's UID as the NCX ``navPoint`` ID and passes it directly to
+    lxml, which raises ``TypeError: Argument must be bytes or unicode, got
+    'NoneType'``. Walk nested TOC sections and links, assigning stable IDs only
+    where needed while preserving existing IDs.
+    """
+    repaired: list[str] = []
+    counter = 0
+
+    def visit(node) -> None:
+        nonlocal counter
+        if isinstance(node, (tuple, list)):
+            for child in node:
+                visit(child)
+            return
+
+        if hasattr(node, "uid"):
+            uid = getattr(node, "uid", None)
+            if not isinstance(uid, str) or not uid.strip():
+                counter += 1
+                generated = f"lingualoom-toc-{counter:04d}"
+                try:
+                    node.uid = generated
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not assign a valid UID to EPUB navigation item "
+                        f"{type(node).__name__}: {exc}"
+                    ) from exc
+                if getattr(node, "uid", None) != generated:
+                    raise RuntimeError(
+                        f"EPUB navigation item {type(node).__name__} did not retain "
+                        f"its generated UID {generated!r}."
+                    )
+                repaired.append(generated)
+
+        # Some third-party TOC node types expose nested links on a `children`
+        # or `items` attribute instead of using EbookLib's usual tuple format.
+        for attr in ("children", "items"):
+            children = getattr(node, attr, None)
+            if isinstance(children, (tuple, list)):
+                visit(children)
+
+    visit(getattr(book, "toc", []))
+    return repaired
+
+
+def write_checkpoint_with_diagnostics(book: epub.EpubBook, checkpoint: Path, source_path: Path) -> None:
+    """Write a checkpoint and save actionable diagnostics when EbookLib fails."""
+    try:
+        epub.write_epub(str(checkpoint), book)
+    except Exception as exc:
+        details = [
+            f"Checkpoint write failed: {type(exc).__name__}: {exc}",
+            f"Source EPUB: {source_path}",
+            f"Checkpoint: {checkpoint}",
+            "Resource inventory (index, class, id, file_name, media_type, raw content type, getter content type):",
+        ]
+        for index, resource in enumerate(book.get_items(), start=1):
+            raw = getattr(resource, "content", None)
+            try:
+                content = resource.get_content()
+                content_type = type(content).__name__ if content is not None else "NoneType"
+            except Exception as read_exc:
+                content_type = f"getter-error:{type(read_exc).__name__}:{read_exc}"
+            details.append(
+                f"{index}: {type(resource).__name__}, id={getattr(resource, 'id', None)!r}, "
+                f"file_name={getattr(resource, 'file_name', None)!r}, "
+                f"media_type={getattr(resource, 'media_type', None)!r}, "
+                f"raw={type(raw).__name__ if raw is not None else 'NoneType'}, getter={content_type}"
+            )
+        details.extend(["", "Full traceback:", traceback.format_exc()])
+        log_path = source_path.with_name(f"{source_path.stem}_lingualoom_error.log")
+        try:
+            log_path.write_text("\n".join(details), encoding="utf-8")
+        except OSError:
+            log_path = None
+        log_note = f" Diagnostic log: {log_path}" if log_path else " (Could not save diagnostic log.)"
+        raise RuntimeError(
+            f"EbookLib failed while writing the EPUB checkpoint: {type(exc).__name__}: {exc}."
+            f" A diagnostic log with the full traceback and resource inventory was created.{log_note}"
+        ) from exc
 
 
 def build_bilingual_html(item, model, source_language, target_language, cache, progress,
@@ -484,10 +596,14 @@ def create_translated_epub(
         with tqdm(
             total=total_blocks,
             desc="Translating",
-            unit="paragraphs",
-            ncols=100,
+            ncols=110,
             dynamic_ncols=False,
-            bar_format="{desc} |{bar:28}| {percentage:3.0f}% ({n_fmt}/{total_fmt} paragraphs) [{elapsed}<{remaining}]",
+            smoothing=0.15,
+            mininterval=0.4,
+            unit="blocks",
+            unit_scale=False,
+            unit_divisor=1000,
+            bar_format="{desc} |{bar:26}| {percentage:3.0f}% {n_fmt}/{total_fmt} blocks | {rate_fmt} | {elapsed} elapsed",
         ) as progress:
             for index, item in enumerate(docs, start=1):
                 progress.set_description_str(f"Chapter {index}/{len(docs)}")
@@ -515,26 +631,14 @@ def create_translated_epub(
                         + ", ".join(repaired_items),
                         flush=True,
                     )
-                try:
-                    epub.write_epub(str(checkpoint), book)
-                except Exception as exc:
-                    # Include resource diagnostics instead of only the generic
-                    # bytes/unicode/NoneType message from the ZIP/XML writer.
-                    none_items = []
-                    for resource in book.get_items():
-                        try:
-                            if resource.get_content() is None:
-                                none_items.append(resource.get_name())
-                        except Exception:
-                            none_items.append(resource.get_name() + " (content read failed)")
-                    detail = (
-                        f"; resources still reporting missing content: {', '.join(none_items)}"
-                        if none_items else "; no resources report missing content"
+                repaired_toc = sanitize_toc_uids(book)
+                if repaired_toc:
+                    print(
+                        "\nWarning: assigned missing IDs to "
+                        f"{len(repaired_toc)} EPUB navigation item(s).",
+                        flush=True,
                     )
-                    raise RuntimeError(
-                        f"EbookLib failed while writing the EPUB checkpoint{detail}. "
-                        f"Original error: {type(exc).__name__}: {exc}"
-                    ) from exc
+                write_checkpoint_with_diagnostics(book, checkpoint, source_path)
                 replace_checkpoint(checkpoint, output)
                 print(f"Checkpoint saved after chapter {index}/{len(docs)}.", flush=True)
     finally:

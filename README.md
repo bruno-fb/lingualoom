@@ -1,8 +1,20 @@
 # LinguaLoom
 
+## Version 1.1.4
+- Fixes EPUB serialization failures caused by navigation/TOC items with missing IDs.
+- Assigns stable IDs only to TOC entries whose UID is missing or invalid.
+- Shows translation throughput in the progress bar while keeping elapsed time visible and avoiding an early ETA.
+
+
 **LinguaLoom** creates a bilingual EPUB for language learners: the original text appears on the left, and a close, learner-friendly translation appears on the right. It uses a locally running [Ollama](https://ollama.com/) model from the Qwen family, so the text is processed by your local model rather than a hosted translation API.
 
 **Author:** Bruno F Blini
+
+## Version 1.1.3
+
+- Normalizes both raw and computed EPUB resource content before each checkpoint write.
+- Saves a diagnostic log with the full traceback and EPUB resource inventory if EbookLib still fails.
+- Refines the progress bar with consistent block counts and elapsed time, avoiding misleading early ETA estimates.
 
 ## Version 1.1.2
 
